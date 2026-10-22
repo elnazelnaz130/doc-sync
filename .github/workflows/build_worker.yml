@@ -1,0 +1,43 @@
+name: Documentation Sync Pipeline
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 */2 * * *'
+
+concurrency:
+  group: doc-sync-worker
+  cancel-in-progress: false
+
+jobs:
+  build-docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Python environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install system rendering and vision utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libreoffice poppler-utils wkhtmltopdf fonts-hosny-amiri
+
+      - name: Execute document compiler
+        env:
+          GDRIVE_OAUTH: ${{ secrets.GDRIVE_OAUTH }}
+          CLINE_KEY_1: ${{ secrets.CLINE_KEY_1 }}
+          CLINE_KEY_2: ${{ secrets.CLINE_KEY_2 }}
+          OPENROUTER_KEY_1: ${{ secrets.OPENROUTER_KEY_1 }}
+          OPENROUTER_KEY_2: ${{ secrets.OPENROUTER_KEY_2 }}
+          OPENROUTER_KEY_3: ${{ secrets.OPENROUTER_KEY_3 }}
+          OPENROUTER_KEY_4: ${{ secrets.OPENROUTER_KEY_4 }}
+          OPENROUTER_KEY_5: ${{ secrets.OPENROUTER_KEY_5 }}
+          OPENROUTER_KEY_6: ${{ secrets.OPENROUTER_KEY_6 }}
+          OPENROUTER_KEY_7: ${{ secrets.OPENROUTER_KEY_7 }}
+          TARGET_MODEL: ${{ secrets.TARGET_MODEL }}
+        run: python doc_compiler.py
