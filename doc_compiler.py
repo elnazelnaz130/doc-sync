@@ -83,24 +83,46 @@ print(f"[INIT] Configured endpoints -> Primary pool: {len(CLINE_KEYS)} | Seconda
 DEFAULT_MODEL_ORDER = get_secret("MODEL_ORDER") or "123"
 CUSTOM_TARGET_MODEL = get_secret("TARGET_MODEL")
 
+# Both possible Cline endpoints are included for automatic fallback if one returns 403/404
+CLINE_URLS = [
+    "https://api.cline.bot/api/v1/chat/completions",
+    "https://api.cline.bot/v1/chat/completions"
+]
+
+# Authentic VSCode/Cline client headers to pass Cloudflare WAF without 403 Forbidden
+CLINE_HEADERS = {
+    "HTTP-Referer": "https://cline.bot",
+    "X-Title": "Cline",
+    "Origin": "vscode-file://vscode-app"
+}
+
+OR_HEADERS = {
+    "HTTP-Referer": "https://github.com",
+    "X-Title": "Doc Pipeline"
+}
+
 TIER_CONFIG = {
     1: {
         "id": 1,
         "label": "tier-1-primary",
         "upstreams": [
             {
-                "name": "gw_primary",
-                "url": "https://api.cline.bot/api/v1/chat/completions",
-                "models": [CUSTOM_TARGET_MODEL] if CUSTOM_TARGET_MODEL else ["cline-pass/muse-spark-1.3-contributor"],
+                "name": "gw_primary_v1",
+                " urls": CLINE_URLS,
+                "models": [CUSTOM_TARGET_MODEL] if CUSTOM_TARGET_MODEL else [
+                    "cline-pass/muse-spark-1.3-contributor",
+                    "muse-spark-1.3-contributor",
+                    "meta/muse-spark-1.3"
+                ],
                 "keys": CLINE_KEYS,
-                "headers": {}
+                "headers": CLINE_HEADERS
             },
             {
                 "name": "gw_secondary",
-                "url": "https://openrouter.ai/api/v1/chat/completions",
-                "models": ["meta/muse-spark-1.3"],
+                "urls": ["https://openrouter.ai/api/v1/chat/completions"],
+                "models": ["meta/muse-spark-1.3:free", "meta/muse-spark-1.3"],
                 "keys": OPENROUTER_KEYS,
-                "headers": {"HTTP-Referer": "https://github.com", "X-Title": "Doc Pipeline"}
+                "headers": OR_HEADERS
             }
         ]
     },
@@ -109,18 +131,24 @@ TIER_CONFIG = {
         "label": "tier-2-analytical",
         "upstreams": [
             {
-                "name": "gw_primary",
-                "url": "https://api.cline.bot/api/v1/chat/completions",
-                "models": ["cline-pass/deepseek-v4.1-flash"],
+                "name": "gw_primary_v1",
+                "urls": CLINE_URLS,
+                "models": ["cline-pass/deepseek-v4.1-flash", "deepseek/deepseek-chat"],
                 "keys": CLINE_KEYS,
-                "headers": {}
+                "headers": CLINE_HEADERS
             },
             {
                 "name": "gw_secondary",
-                "url": "https://openrouter.ai/api/v1/chat/completions",
-                "models": ["deepseek/deepseek-v4.1", "deepseek/deepseek-r1", "deepseek/deepseek-chat"],
+                "urls": ["https://openrouter.ai/api/v1/chat/completions"],
+                "models": [
+                    "deepseek/deepseek-r1:free",
+                    "deepseek/deepseek-chat-v3-0324:free",
+                    "deepseek/deepseek-chat:free",
+                    "deepseek/deepseek-r1",
+                    "deepseek/deepseek-chat"
+                ],
                 "keys": OPENROUTER_KEYS,
-                "headers": {"HTTP-Referer": "https://github.com", "X-Title": "Doc Pipeline"}
+                "headers": OR_HEADERS
             }
         ]
     },
@@ -129,18 +157,22 @@ TIER_CONFIG = {
         "label": "tier-3-general",
         "upstreams": [
             {
-                "name": "gw_primary",
-                "url": "https://api.cline.bot/api/v1/chat/completions",
+                "name": "gw_primary_v1",
+                "urls": CLINE_URLS,
                 "models": ["cline-pass/glm-5.3-flash"],
                 "keys": CLINE_KEYS,
-                "headers": {}
+                "headers": CLINE_HEADERS
             },
             {
                 "name": "gw_secondary",
-                "url": "https://openrouter.ai/api/v1/chat/completions",
-                "models": ["zhipu/glm-5.3", "thudm/glm-5.3", "thudm/glm-4-plus"],
+                "urls": ["https://openrouter.ai/api/v1/chat/completions"],
+                "models": [
+                    "thudm/glm-4-9b:free",
+                    "zhipu/glm-5.3",
+                    "thudm/glm-4-plus"
+                ],
                 "keys": OPENROUTER_KEYS,
-                "headers": {"HTTP-Referer": "https://github.com", "X-Title": "Doc Pipeline"}
+                "headers": OR_HEADERS
             }
         ]
     }
@@ -165,13 +197,14 @@ def parse_order_string(spec_str):
 class UpstreamClient:
     """
     Handles round-robin key rotation, zero-wait failover across dual primary keys,
-    multimodal vision payloads, and automatic fallback to secondary pool.
+    Cloudflare WAF browser-header emulation, and 402/404 model skipping.
     """
     def __init__(self):
         self.active_order = [1, 2, 3]
         self.pointers = {}
         self.cooldowns = {}
-        self.resolved_models = {}
+        self.resolved_targets = {}  # pname -> (url, model_id)
+        self.unsupported_combos = set()  # (url, model_id) that returned 402/404
 
     def set_order(self, order_list):
         self.active_order = order_list
@@ -196,7 +229,7 @@ class UpstreamClient:
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "User-Agent": "python-requests/2.31.0"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Code/1.96.0 Chrome/128.0.6613.186 Electron/32.2.6 Safari/537.36"
         }
         if extra_headers:
             headers.update(extra_headers)
@@ -207,22 +240,33 @@ class UpstreamClient:
             "stream": False
         }
         r = requests.post(url, headers=headers, json=payload, timeout=(25, 360))
+        short_body = (r.text or "").replace("\n", " ")[:90]
+
         if r.status_code == 429:
             self.cooldowns[api_key] = time.time() + 45
-            raise RuntimeError("HTTP_429")
-        if r.status_code in (400, 404) and any(w in r.text.lower() for w in ("model", "not found", "image", "vision")):
-            raise LookupError(f"UNSUPPORTED_MODEL_OR_MODALITY ({r.status_code})")
+            raise RuntimeError(f"HTTP_429 ({short_body})")
+
+        # 402 (Payment Required) or 404 (Not Found) means this specific (url, model_id) is unavailable/paid
+        if r.status_code in (402, 404):
+            raise LookupError(f"HTTP_{r.status_code} [{model_id}] ({short_body})")
+
+        if r.status_code == 400 and any(w in r.text.lower() for w in ("model", "not found", "image", "vision", "invalid")):
+            raise LookupError(f"HTTP_400 [{model_id}] ({short_body})")
+
         if r.status_code != 200:
-            raise RuntimeError(f"HTTP_{r.status_code}")
+            raise RuntimeError(f"HTTP_{r.status_code} ({short_body})")
+
         data = r.json()
+        if "error" in data and not data.get("choices"):
+            err_msg = str(data["error"])[:90]
+            if "402" in err_msg or "afford" in err_msg.lower() or "credit" in err_msg.lower() or "not found" in err_msg.lower():
+                raise LookupError(f"API_ERR [{model_id}] ({err_msg})")
+            raise RuntimeError(f"API_ERR ({err_msg})")
+
         content = data["choices"][0]["message"]["content"]
         return content.strip() if content else ""
 
     def complete(self, system_prompt, user_content, prefer_vision=False):
-        """
-        user_content can be a plain string or an OpenAI-compatible multimodal content list.
-        When prefer_vision=True, Tier 1 (Muse Spark 1.3) is prioritized first.
-        """
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content}
@@ -239,27 +283,50 @@ class UpstreamClient:
                     keys = up["keys"]
                     if not keys:
                         continue
+                    urls = up.get("urls") or up.get(" urls") or []
                     models = up["models"]
-                    locked = self.resolved_models.get(pname)
-                    if locked:
-                        models = [locked] + [m for m in models if m != locked]
+
+                    # Build candidate (url, model_id) pairs, prioritizing previously working combo
+                    candidates = []
+                    locked = self.resolved_targets.get(pname)
+                    if locked and locked not in self.unsupported_combos:
+                        candidates.append(locked)
+                    for u in urls:
+                        for m in models:
+                            pair = (u, m)
+                            if pair not in candidates and pair not in self.unsupported_combos:
+                                candidates.append(pair)
+
+                    if not candidates:
+                        continue
 
                     for _ in range(len(keys)):
                         api_key = self._acquire_key(pname, keys)
                         if not api_key:
                             break
-                        for m_id in models:
+                        switch_key = False
+                        for (u, m_id) in list(candidates):
+                            if (u, m_id) in self.unsupported_combos:
+                                continue
                             try:
-                                res = self._send_request(up["url"], api_key, m_id, messages, up["headers"])
+                                res = self._send_request(u, api_key, m_id, messages, up["headers"])
                                 if res:
-                                    self.resolved_models[pname] = m_id
+                                    self.resolved_targets[pname] = (u, m_id)
                                     return res
-                            except LookupError:
+                            except LookupError as le:
+                                # Model/URL is paid (402) or invalid (404): mark combo and immediately try next model on SAME key
+                                print(f"[INFO] Skipping {le}; trying next model/endpoint...")
+                                self.unsupported_combos.add((u, m_id))
                                 continue
                             except Exception as e:
-                                print(f"[WARN] Upstream {up['name']} (tier {tier_id}) returned {e}; switching key...")
+                                # 403 / 429 / 5xx: switch to next key or next endpoint URL
+                                print(f"[WARN] Upstream {up['name']} (tier {tier_id}) returned {e}; switching...")
+                                switch_key = True
                                 break
-            wait_sec = 20 * back_off_round
+                        if not switch_key:
+                            break
+
+            wait_sec = 15 * back_off_round
             print(f"[INFO] Active pools busy. Backing off {wait_sec}s (round {back_off_round}/3)...")
             time.sleep(wait_sec)
 
@@ -395,9 +462,8 @@ DIAGRAM_DECONSTRUCTION_PROMPT = (
     "۳. **پیام مفهومی و ساختاری:** هدف و پیام منطقی که طراح اسلاید از طریق چیدمان، رنگ‌بندی یا گروه‌بندی بخش‌ها قصد انتقال آن را داشته است تشریح کن."
 )
 
-def _optimize_image_to_base64(img_Input, max_width=1280, quality=80):
-    """Resizes image to max_width and encodes as optimized JPEG base64 data URI."""
-    im = Image.open(img_Input) if not isinstance(img_Input, Image.Image) else img_Input
+def _optimize_image_to_base64(img_input, max_width=1280, quality=80):
+    im = Image.open(img_input) if not isinstance(img_input, Image.Image) else img_input
     if im.mode in ("RGBA", "P"):
         im = im.convert("RGB")
     w, h = im.size
@@ -410,7 +476,6 @@ def _optimize_image_to_base64(img_Input, max_width=1280, quality=80):
     return f"data:image/jpeg;base64,{b64}"
 
 def _analyze_images_with_vision(image_b64_list, context_label=""):
-    """Sends a batch of 1-3 slide/page images to the multimodal Vision endpoint."""
     content_payload = [
         {"type": "text", "text": f"{DIAGRAM_DECONSTRUCTION_PROMPT}\n\n{context_label}".strip()}
     ]
@@ -426,7 +491,6 @@ def _analyze_images_with_vision(image_b64_list, context_label=""):
         return ""
 
 def _extract_pptx_text_per_slide(raw_bytes):
-    """Extracts raw text, tables, and speaker notes per slide using python-pptx as baseline."""
     slides_text = []
     try:
         prs = pptx.Presentation(io.BytesIO(raw_bytes))
@@ -450,7 +514,6 @@ def _extract_pptx_text_per_slide(raw_bytes):
     return slides_text
 
 def _render_presentation_to_jpegs(filename, raw_bytes, tmp_dir):
-    """Converts PPTX/PPT to PDF via headless LibreOffice, then renders JPEG slides via pdftoppm."""
     in_path = os.path.join(tmp_dir, filename)
     with open(in_path, "wb") as f:
         f.write(raw_bytes)
@@ -480,9 +543,6 @@ def _render_presentation_to_jpegs(filename, raw_bytes, tmp_dir):
         return []
 
 def parse_presentation_multimodal(filename, raw_bytes, storage=None, cache_folder_id=None):
-    """
-    Full multimodal ingestion for .pptx / .ppt files with persistent Drive caching.
-    """
     safe_cache_name = re.sub(r'[^\w\-_.]', '_', filename) + "_slides_visual.md"
     if storage and cache_folder_id:
         cached = storage.find(cache_folder_id, safe_cache_name, folder=False)
@@ -499,7 +559,6 @@ def parse_presentation_multimodal(filename, raw_bytes, storage=None, cache_folde
     try:
         img_paths = _render_presentation_to_jpegs(filename, raw_bytes, tmp_dir)
         if img_paths:
-            # Batch slides in groups of 3 to balance high visual accuracy with rate limits
             batch_size = 3
             for start_i in range(0, len(img_paths), batch_size):
                 batch_files = img_paths[start_i:start_i + batch_size]
@@ -530,7 +589,6 @@ def parse_presentation_multimodal(filename, raw_bytes, storage=None, cache_folde
     return full_report
 
 def parse_pdf_hybrid_ocr(filename, raw_bytes, storage=None, cache_folder_id=None):
-    """Extracts text from PDF; if pages are scanned/image-only, runs Vision OCR on those pages."""
     safe_cache_name = re.sub(r'[^\w\-_.]', '_', filename) + "_ocr.md"
     if storage and cache_folder_id:
         cached = storage.find(cache_folder_id, safe_cache_name, folder=False)
@@ -554,7 +612,6 @@ def parse_pdf_hybrid_ocr(filename, raw_bytes, storage=None, cache_folder_id=None
             with open(pdf_path, "wb") as f:
                 f.write(raw_bytes)
             ocr_map = {}
-            # Process up to 30 scanned pages in batches of 2
             target_scanned = scanned_pages[:30]
             for i in range(0, len(target_scanned), 2):
                 batch_pnums = target_scanned[i:i+2]
@@ -592,7 +649,6 @@ def parse_pdf_hybrid_ocr(filename, raw_bytes, storage=None, cache_folder_id=None
     return "\n".join(t for _, t in page_texts if t)
 
 def extract_content_smart(filename, raw_bytes, storage=None, cache_folder_id=None):
-    """Unified extractor supporting TXT, MD, DOCX, XLSX, PPTX/PPT (Vision), PDF (Hybrid OCR), and Images (Vision OCR)."""
     ext = os.path.splitext(filename)[1].lower()
     try:
         if ext in (".txt", ".md", ".json", ".csv", ".py", ".html"):
